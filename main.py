@@ -1,6 +1,8 @@
 import os
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from typing import List
 
 app = FastAPI()
 
@@ -64,6 +66,73 @@ def test_database():
     
     return response
 
+# -------- File Upload Endpoints --------
+UPLOAD_DIR = os.path.join(os.getcwd(), "uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+@app.post("/api/upload")
+async def upload_file(file: UploadFile = File(...)):
+    if not file:
+        raise HTTPException(status_code=400, detail="No file uploaded")
+
+    safe_name = os.path.basename(file.filename)
+    if safe_name == "":
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
+    dest_path = os.path.join(UPLOAD_DIR, safe_name)
+
+    size = 0
+    with open(dest_path, "wb") as out:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            out.write(chunk)
+
+    # Save metadata to DB if available
+    meta = {
+        "filename": safe_name,
+        "content_type": file.content_type,
+        "size": size,
+        "path": f"uploads/{safe_name}",
+    }
+
+    try:
+        from database import create_document
+        create_document("upload", meta)
+    except Exception:
+        # Database optional; continue without failing
+        pass
+
+    return {"status": "ok", "filename": safe_name, "size": size, "content_type": file.content_type}
+
+@app.get("/api/uploads")
+async def list_uploads():
+    # Prefer DB list when available, otherwise list filesystem
+    try:
+        from database import db
+        if db is not None:
+            docs = list(db["upload"].find({}, {"_id": 0}).sort("created_at", -1).limit(50))
+            return {"items": docs}
+    except Exception:
+        pass
+
+    # Fallback to filesystem
+    items: List[dict] = []
+    try:
+        for name in sorted(os.listdir(UPLOAD_DIR)):
+            p = os.path.join(UPLOAD_DIR, name)
+            if os.path.isfile(p):
+                items.append({
+                    "filename": name,
+                    "size": os.path.getsize(p),
+                    "path": f"uploads/{name}"
+                })
+    except FileNotFoundError:
+        pass
+
+    return {"items": list(reversed(items))[:50]}
 
 if __name__ == "__main__":
     import uvicorn
